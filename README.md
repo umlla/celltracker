@@ -28,8 +28,7 @@
 
 安装依赖：
 
-```bash
-pip install streamlit pandas plotly```
+```bash pip install streamlit pandas plotly ```
 
 ## 🚀 快速启动
 
