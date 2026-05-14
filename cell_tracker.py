@@ -463,6 +463,23 @@ if menu == "🧫 在养细胞":
                                     conn.close()
                                     st.success(f"批次「{batch['batch_name']}」已终止（原因：{end_reason}）")
                                     st.rerun()
+                            st.write("---")
+                            with st.expander("🗑 删除此批次（危险操作）"):
+                                st.error("此操作将永久删除该批次及其所有传代记录，且不可恢复！")
+                                del_batch_confirm = st.checkbox(
+                                    "我确认要删除此批次及所有传代记录",
+                                    key=f"del_batch_confirm_{batch_id}"
+                                )
+                                if del_batch_confirm:
+                                    if st.button("删除批次", key=f"btn_del_batch_{batch_id}"):
+                                        conn = get_connection()
+                                        conn.execute("DELETE FROM culture_records WHERE batch_id = ?", (batch_id,))
+                                        conn.execute("UPDATE frozen_vials SET batch_id = NULL WHERE batch_id = ?", (batch_id,))
+                                        conn.execute("DELETE FROM culture_batches WHERE id = ?", (batch_id,))
+                                        conn.commit()
+                                        conn.close()
+                                        st.success(f"批次「{batch['batch_name']}」及其传代记录已删除。")
+                                        st.rerun()
 
             # 冻存状态
             st.subheader("❄️ 冻存状态")
