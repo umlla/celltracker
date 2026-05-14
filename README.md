@@ -56,7 +56,6 @@
 ## 🗄️ 数据库
 
 - 使用 SQLite，文件 `cell_data.db` 位于脚本同目录。
-- 已通过 `.gitignore` 排除，不会上传到 GitHub。
 
 ## 📄 许可证
 
