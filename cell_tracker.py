@@ -11,7 +11,7 @@ DB_NAME = "cell_data.db"
 def init_db():
     conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
-
+    
     c.execute('''
         CREATE TABLE IF NOT EXISTS cell_lines (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -97,6 +97,18 @@ def init_db():
     conn.close()
 
 init_db()
+def upgrade_db():
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    # ... 其他已有升级 ...
+    # 新增排序字段
+    try:
+        c.execute("ALTER TABLE cell_group_members ADD COLUMN sort_order INTEGER DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass
+    conn.commit()
+    conn.close()
+upgrade_db()
 
 # ==================== 辅助函数 ====================
 
@@ -153,12 +165,17 @@ def get_groups():
 
 def get_group_members(group_id):
     conn = get_connection()
+    # 检查列是否存在，若不存在则添加
+    cols = [row[1] for row in conn.execute("PRAGMA table_info(cell_group_members)").fetchall()]
+    if 'sort_order' not in cols:
+        conn.execute("ALTER TABLE cell_group_members ADD COLUMN sort_order INTEGER DEFAULT 0")
+        conn.commit()
     df = pd.read_sql_query('''
-        SELECT cl.id, cl.name, cl.type
+        SELECT cl.id, cl.name, cl.type, gm.sort_order
         FROM cell_group_members gm
         JOIN cell_lines cl ON gm.cell_line_id = cl.id
         WHERE gm.group_id = ?
-        ORDER BY cl.name
+        ORDER BY gm.sort_order, cl.name
     ''', conn, params=(group_id,))
     conn.close()
     return df
@@ -658,119 +675,312 @@ elif menu == "📂 管理细胞组":
                     conn.close()
                     st.rerun()
 
-    with tab2:
-        st.subheader("修改组成员")
-        groups_df = get_groups()
-        if groups_df.empty:
-            st.info("请先创建细胞组。")
-        else:
-            group_name = st.selectbox("选择细胞组", groups_df["group_name"].tolist())
-            group_id = int(groups_df[groups_df["group_name"] == group_name]["id"].iloc[0])
-            current_members = get_group_members(group_id)["name"].tolist()
-            all_lines = get_all_cell_lines()
-            all_names = all_lines["name"].tolist() if not all_lines.empty else []
-            new_members = st.multiselect("组成员（勾选添加，取消勾选移除）", options=all_names, default=current_members)
-            if st.button("保存成员更改"):
-                to_add = list(set(new_members) - set(current_members))
-                to_remove = list(set(current_members) - set(new_members))
-                conn = get_connection()
-                for name in to_add:
-                    line_id = int(all_lines[all_lines["name"] == name]["id"].iloc[0])
-                    conn.execute("INSERT OR IGNORE INTO cell_group_members (group_id, cell_line_id) VALUES (?,?)",
-                                 (group_id, line_id))
-                for name in to_remove:
-                    line_id = int(all_lines[all_lines["name"] == name]["id"].iloc[0])
-                    conn.execute("DELETE FROM cell_group_members WHERE group_id = ? AND cell_line_id = ?",
-                                 (group_id, line_id))
-                conn.commit()
-                conn.close()
-                st.success("已更新组成员。")
-                st.rerun()
+        with tab2:
+            st.subheader("修改组成员与排序")
+            groups_df = get_groups()
+            if groups_df.empty:
+                st.info("请先创建细胞组。")
+            else:
+                group_name = st.selectbox("选择细胞组", groups_df["group_name"].tolist())
+                group_id = int(groups_df[groups_df["group_name"] == group_name]["id"].iloc[0])
+                members_df = get_group_members(group_id)
+
+                # ---------- 成员选择（不变） ----------
+                all_lines = get_all_cell_lines()
+                all_names = all_lines["name"].tolist() if not all_lines.empty else []
+                current_members = members_df["name"].tolist()
+                new_members = st.multiselect("组成员（勾选添加，取消勾选移除）",
+                                            options=all_names, default=current_members)
+                if st.button("保存成员更改"):
+                    to_add = list(set(new_members) - set(current_members))
+                    to_remove = list(set(current_members) - set(new_members))
+                    conn = get_connection()
+                    # 添加新成员，sort_order 取当前最大值+1
+                    max_order = conn.execute("SELECT MAX(sort_order) FROM cell_group_members WHERE group_id = ?",
+                                            (group_id,)).fetchone()[0] or 0
+                    for name in to_add:
+                        line_id = int(all_lines[all_lines["name"] == name]["id"].iloc[0])
+                        max_order += 1
+                        conn.execute("INSERT OR IGNORE INTO cell_group_members (group_id, cell_line_id, sort_order) VALUES (?,?,?)",
+                                    (group_id, line_id, max_order))
+                    for name in to_remove:
+                        line_id = int(all_lines[all_lines["name"] == name]["id"].iloc[0])
+                        conn.execute("DELETE FROM cell_group_members WHERE group_id = ? AND cell_line_id = ?",
+                                    (group_id, line_id))
+                    conn.commit()
+                    conn.close()
+                    st.success("成员已更新。")
+                    st.rerun()
+
+                         # ---------- 排序调整 ----------
+                        # ---------- 排序调整 ----------
+                if not members_df.empty:
+                    if 'sort_order' not in members_df.columns:
+                        members_df['sort_order'] = 0
+                    st.markdown("---")
+                    st.subheader("调整排序（修改数字后点击保存）")
+
+                    # 准备用于编辑的表格
+                    order_df = members_df[['id', 'name', 'sort_order']].copy()
+                    order_df['sort_order'] = order_df['sort_order'].astype(int)
+
+                    edited_order = st.data_editor(
+                        order_df,
+                        column_config={
+                            "id": None,  # 隐藏ID列
+                            "name": st.column_config.TextColumn("细胞株", disabled=True),
+                            "sort_order": st.column_config.NumberColumn("排序号", min_value=0, step=1)
+                        },
+                        width='stretch',
+                        hide_index=True,
+                        num_rows="fixed"
+                    )
+
+                    if st.button("保存排序"):
+                        conn = get_connection()
+                        for _, row in edited_order.iterrows():
+                            conn.execute(
+                                "UPDATE cell_group_members SET sort_order = ? WHERE group_id = ? AND cell_line_id = ?",
+                                (int(row["sort_order"]), group_id, int(row["id"]))
+                            )
+                        conn.commit()
+                        conn.close()
+                        st.success("排序已更新")
+                        st.rerun()
+
 
 # ==================== 4. 新建传代记录 ====================
 elif menu == "🧬 新建传代记录":
     st.header("新建传代记录")
-    all_lines = get_all_cell_lines()
-    if all_lines.empty:
-        st.warning("请先添加细胞株和批次。")
-    else:
-        # 选择细胞株（不在 form 内）
-        line_name = st.selectbox("选择细胞株", all_lines["name"].tolist())
-        selected_line_id = int(all_lines[all_lines["name"] == line_name]["id"].iloc[0])
-        line_info = get_cell_line_info(selected_line_id)
-        default_interval = line_info["default_passage_interval"]
+    mode = st.radio("录入模式", ["按组录入（表格式）", "单批次录入"], horizontal=True, index=0)
 
-        conn = get_connection()
-        batches_df = pd.read_sql_query(
-            "SELECT id, batch_name FROM culture_batches WHERE cell_line_id = ? AND is_active = 1",
-            conn, params=(selected_line_id,))
-        conn.close()
-
-        if batches_df.empty:
-            st.error("该细胞株没有活跃批次，请先创建批次。")
+    # ========================= 按组录入（表格式） =========================
+    if mode == "按组录入（表格式）":
+        groups_df = get_groups()
+        if groups_df.empty:
+            st.warning("暂无细胞组，请先创建或切换到单批次录入。")
         else:
-            # ---------- 批次选择移到表单外，以便实时计算默认代数 ----------
-            batch_choice = st.selectbox("选择培养批次", batches_df["batch_name"].tolist())
-            selected_batch_id = int(batches_df[batches_df["batch_name"] == batch_choice]["id"].iloc[0])
+            group_name = st.selectbox("选择细胞组", groups_df["group_name"].tolist())
+            group_id = int(groups_df[groups_df["group_name"] == group_name]["id"].iloc[0])
+            members_df = get_group_members(group_id)
+            if members_df.empty:
+                st.warning("该组暂无成员。")
+            else:
+                # 构建表格数据：每个细胞株的活跃批次，预填默认值
+                table_data = []
+                today_str = datetime.today().strftime("%Y-%m-%d")
+                for _, member in members_df.iterrows():
+                    line_id = member["id"]
+                    line_name = member["name"]
+                    line_info = get_cell_line_info(line_id)
+                    default_interval = line_info["default_passage_interval"]
 
-            # 获取该批次当前最大传代次数
+                    conn = get_connection()
+                    batches = pd.read_sql_query(
+                        "SELECT id, batch_name FROM culture_batches WHERE cell_line_id = ? AND is_active = 1",
+                        conn, params=(line_id,))
+                    conn.close()
+
+                    if batches.empty:
+                        continue
+                    for _, batch in batches.iterrows():
+                        batch_id = batch["id"]
+                        batch_name = batch["batch_name"]
+                        # 获取当前最大代次
+                        conn = get_connection()
+                        max_p = pd.read_sql_query(
+                            "SELECT MAX(passage) FROM culture_records WHERE batch_id = ?",
+                            conn, params=(batch_id,)).iloc[0, 0]
+                        conn.close()
+                        next_p = int(max_p) + 1 if max_p is not None else 1
+                        table_data.append({
+                            "细胞株": line_name,
+                            "批次": batch_name,
+                            "批次ID": batch_id,
+                            "传代次数": next_p,
+                            "传代日期": today_str,
+                            "收获细胞总数": 0.0,
+                            "种下盘数": 1,
+                            "每盘细胞数": 0.0,
+                            "细胞状态": "良好",
+                            "建议间隔天数": default_interval,
+                            "备注": ""
+                        })
+
+                if not table_data:
+                    st.info("该组内所有细胞株均无活跃批次，请先创建批次。")
+                else:
+                    st.subheader(f"批量传代 - {group_name}")
+                    df = pd.DataFrame(table_data)
+
+                    # 配置列的显示与编辑规则
+                    column_config = {
+                        "细胞株": st.column_config.TextColumn("细胞株", disabled=True, width="small"),
+                        "批次": st.column_config.TextColumn("批次", disabled=True, width="small"),
+                        "批次ID": None,  # 隐藏该列
+                        "传代次数": st.column_config.NumberColumn("传代次数", min_value=1, step=1, width="small"),
+                        "传代日期": st.column_config.TextColumn("传代日期", width="small"),
+                        "收获细胞总数": st.column_config.NumberColumn("收获总数", min_value=0.0, format="%.2f", width="small"),
+                        "种下盘数": st.column_config.NumberColumn("盘数", min_value=1, step=1, width="small"),
+                        "每盘细胞数": st.column_config.NumberColumn("每盘细胞数", min_value=0.0, format="%.2f", width="small"),
+                        "细胞状态": st.column_config.SelectboxColumn("状态", options=["良好", "一般", "较差", "污染"], width="small"),
+                        "建议间隔天数": st.column_config.NumberColumn("间隔天数", min_value=0, step=1, width="small"),
+                        "备注": st.column_config.TextColumn("备注", width="small")
+                    }
+
+                    edited_df = st.data_editor(
+                        df,
+                        column_config=column_config,
+                        width='stretch',  
+                        hide_index=True,
+                        num_rows="fixed",
+                        column_order=["细胞株", "批次", "传代次数", "传代日期", "收获细胞总数",
+                                      "种下盘数", "每盘细胞数", "细胞状态", "建议间隔天数", "备注"]
+                    )
+
+                    if st.button("批量提交", type="primary"):
+                        errors = []
+                        success_count = 0
+                        # 提交时，从原始 df 获取隐藏的批次ID
+                        for idx, row in edited_df.iterrows():
+                            try:
+                                batch_id = int(df.at[idx, "批次ID"])
+                                passage = int(row["传代次数"])
+                                date_str = str(row["传代日期"])[:10]
+                                try:
+                                    date_obj = datetime.strptime(date_str, "%Y-%m-%d").date()
+                                except:
+                                    errors.append(f"第{idx+1}行日期格式错误，请使用YYYY-MM-DD")
+                                    continue
+                                harvested_cells = float(row["收获细胞总数"])
+                                inoculum_dishes = int(row["种下盘数"])
+                                per_dish_cells = float(row["每盘细胞数"])
+                                inoculum_cells = inoculum_dishes * per_dish_cells
+                                status = row["细胞状态"]
+                                next_days = int(row["建议间隔天数"])
+                                notes = row["备注"]
+
+                                # 计算 PD
+                                prev_active = get_batch_active_record(batch_id)
+                                if prev_active is not None:
+                                    prev_inoculum = prev_active["inoculum_cells"]
+                                    prev_cumulative_pd = prev_active["cumulative_pd"]
+                                else:
+                                    conn = get_connection()
+                                    batch_info = pd.read_sql_query(
+                                        "SELECT initial_pd, initial_cell_count FROM culture_batches WHERE id = ?",
+                                        conn, params=(batch_id,))
+                                    conn.close()
+                                    initial_pd = batch_info.iloc[0]['initial_pd'] if not batch_info.empty else 0.0
+                                    initial_cell_count = batch_info.iloc[0]['initial_cell_count'] if not batch_info.empty else None
+                                    prev_inoculum = initial_cell_count if initial_cell_count else 0
+                                    prev_cumulative_pd = initial_pd
+
+                                pd_value = calculate_pd(harvested_cells, prev_inoculum)
+                                cumulative_pd = round(prev_cumulative_pd + pd_value, 2)
+
+                                conn = get_connection()
+                                conn.execute("UPDATE culture_records SET is_active = 0 WHERE batch_id = ? AND is_active = 1", (batch_id,))
+                                next_date = None
+                                if next_days > 0:
+                                    next_date = (date_obj + timedelta(days=next_days)).isoformat()
+                                conn.execute('''INSERT INTO culture_records
+                                    (batch_id, passage, date, inoculum_cells, inoculum_dishes, harvested_cells,
+                                     pd, cumulative_pd, status, next_passage_date, is_active, notes)
+                                    VALUES (?,?,?,?,?,?,?,?,?,?,1,?)''',
+                                    (batch_id, passage, date_obj.isoformat(), inoculum_cells, inoculum_dishes,
+                                     harvested_cells, pd_value, cumulative_pd, status, next_date, notes))
+                                conn.commit()
+                                conn.close()
+                                success_count += 1
+                            except Exception as e:
+                                errors.append(f"第{idx+1}行提交失败：{e}")
+
+                        if errors:
+                            for e in errors:
+                                st.error(e)
+                        st.success(f"成功提交 {success_count} 条传代记录。")
+                        if not errors:
+                            st.rerun()
+
+    # ========================= 单批次录入（保留原逻辑） =========================
+    else:
+        all_lines = get_all_cell_lines()
+        if all_lines.empty:
+            st.warning("请先添加细胞株和批次。")
+        else:
+            line_name = st.selectbox("选择细胞株", all_lines["name"].tolist())
+            selected_line_id = int(all_lines[all_lines["name"] == line_name]["id"].iloc[0])
+            line_info = get_cell_line_info(selected_line_id)
+            default_interval = line_info["default_passage_interval"]
+
             conn = get_connection()
-            max_passage = pd.read_sql_query(
-                "SELECT MAX(passage) as max_p FROM culture_records WHERE batch_id = ?",
-                conn, params=(selected_batch_id,)).iloc[0, 0]
+            batches_df = pd.read_sql_query(
+                "SELECT id, batch_name FROM culture_batches WHERE cell_line_id = ? AND is_active = 1",
+                conn, params=(selected_line_id,))
             conn.close()
-            default_passage = int(max_passage) + 1 if max_passage is not None else 1
 
-            with st.form("add_culture"):
-                passage = st.number_input("传代次数 (P)", min_value=1,
-                                          value=default_passage,  # 自动递增
-                                          step=1)
-                date_input = st.date_input("传代日期", value=datetime.today())
-                harvested_cells = st.number_input("本次收获细胞总数（×10⁵ cells）", min_value=0.0, format="%.2f")
-                inoculum_dishes = st.number_input("本次传代种下盘数", min_value=1, value=1)
-                per_dish_cells = st.number_input("每盘细胞数（×10⁵ cells）", min_value=0.0, format="%.2f")
-                inoculum_cells = inoculum_dishes * per_dish_cells
-                status = st.selectbox("细胞状态", ["良好", "一般", "较差", "污染"])
-                next_days = st.number_input("建议下次传代间隔天数",
-                                            min_value=0,
-                                            value=default_interval if default_interval > 0 else 0)
-                notes = st.text_area("备注")
-                if st.form_submit_button("提交"):
-                    # 获取批次初始值
-                    conn = get_connection()
-                    batch_info = pd.read_sql_query(
-                        "SELECT initial_pd, initial_cell_count FROM culture_batches WHERE id = ?",
-                        conn, params=(selected_batch_id,))
-                    conn.close()
-                    initial_pd = batch_info.iloc[0]['initial_pd'] if not batch_info.empty else 0.0
-                    initial_cell_count = batch_info.iloc[0]['initial_cell_count'] if not batch_info.empty else None
+            if batches_df.empty:
+                st.error("该细胞株没有活跃批次，请先创建批次。")
+            else:
+                batch_choice = st.selectbox("选择培养批次", batches_df["batch_name"].tolist())
+                selected_batch_id = int(batches_df[batches_df["batch_name"] == batch_choice]["id"].iloc[0])
 
-                    prev_active = get_batch_active_record(selected_batch_id)
-                    if prev_active is not None:
-                        prev_inoculum = prev_active["inoculum_cells"]
-                        prev_cumulative_pd = prev_active["cumulative_pd"]
-                    else:
-                        prev_inoculum = initial_cell_count if initial_cell_count else 0
-                        prev_cumulative_pd = initial_pd
+                # 获取默认代次
+                conn = get_connection()
+                max_passage = pd.read_sql_query(
+                    "SELECT MAX(passage) FROM culture_records WHERE batch_id = ?",
+                    conn, params=(selected_batch_id,)).iloc[0, 0]
+                conn.close()
+                default_passage = int(max_passage) + 1 if max_passage is not None else 1
 
-                    pd_value = calculate_pd(harvested_cells, prev_inoculum)
-                    cumulative_pd = round(prev_cumulative_pd + pd_value, 2)
+                with st.form("add_culture"):
+                    passage = st.number_input("传代次数 (P)", min_value=1, value=default_passage, step=1)
+                    date_input = st.date_input("传代日期", value=datetime.today())
+                    harvested_cells = st.number_input("本次收获细胞总数（×10⁵ cells）", min_value=0.0, format="%.2f")
+                    inoculum_dishes = st.number_input("本次传代种下盘数", min_value=1, value=1)
+                    per_dish_cells = st.number_input("每盘细胞数（×10⁵ cells）", min_value=0.0, format="%.2f")
+                    inoculum_cells = inoculum_dishes * per_dish_cells
+                    status = st.selectbox("细胞状态", ["良好", "一般", "较差", "污染"])
+                    next_days = st.number_input("建议下次传代间隔天数",
+                                                min_value=0,
+                                                value=default_interval if default_interval > 0 else 0)
+                    notes = st.text_area("备注")
+                    if st.form_submit_button("提交"):
+                        conn = get_connection()
+                        batch_info = pd.read_sql_query(
+                            "SELECT initial_pd, initial_cell_count FROM culture_batches WHERE id = ?",
+                            conn, params=(selected_batch_id,))
+                        conn.close()
+                        initial_pd = batch_info.iloc[0]['initial_pd'] if not batch_info.empty else 0.0
+                        initial_cell_count = batch_info.iloc[0]['initial_cell_count'] if not batch_info.empty else None
 
-                    conn = get_connection()
-                    conn.execute("UPDATE culture_records SET is_active = 0 WHERE batch_id = ? AND is_active = 1",
-                                 (selected_batch_id,))
-                    next_date = None
-                    if next_days > 0:
-                        next_date = (date_input + timedelta(days=next_days)).isoformat()
-                    conn.execute('''INSERT INTO culture_records
-                        (batch_id, passage, date, inoculum_cells, inoculum_dishes, harvested_cells,
-                         pd, cumulative_pd, status, next_passage_date, is_active, notes)
-                        VALUES (?,?,?,?,?,?,?,?,?,?,1,?)''',
-                        (selected_batch_id, passage, date_input.isoformat(), inoculum_cells, inoculum_dishes,
-                         harvested_cells, pd_value, cumulative_pd, status, next_date, notes))
-                    conn.commit()
-                    conn.close()
-                    st.success("传代记录已添加。")
+                        prev_active = get_batch_active_record(selected_batch_id)
+                        if prev_active is not None:
+                            prev_inoculum = prev_active["inoculum_cells"]
+                            prev_cumulative_pd = prev_active["cumulative_pd"]
+                        else:
+                            prev_inoculum = initial_cell_count if initial_cell_count else 0
+                            prev_cumulative_pd = initial_pd
+
+                        pd_value = calculate_pd(harvested_cells, prev_inoculum)
+                        cumulative_pd = round(prev_cumulative_pd + pd_value, 2)
+
+                        conn = get_connection()
+                        conn.execute("UPDATE culture_records SET is_active = 0 WHERE batch_id = ? AND is_active = 1",
+                                     (selected_batch_id,))
+                        next_date = None
+                        if next_days > 0:
+                            next_date = (date_input + timedelta(days=next_days)).isoformat()
+                        conn.execute('''INSERT INTO culture_records
+                            (batch_id, passage, date, inoculum_cells, inoculum_dishes, harvested_cells,
+                             pd, cumulative_pd, status, next_passage_date, is_active, notes)
+                            VALUES (?,?,?,?,?,?,?,?,?,?,1,?)''',
+                            (selected_batch_id, passage, date_input.isoformat(), inoculum_cells, inoculum_dishes,
+                             harvested_cells, pd_value, cumulative_pd, status, next_date, notes))
+                        conn.commit()
+                        conn.close()
+                        st.success("传代记录已添加。")
 
 # ==================== 5. 添加冻存管（含孔位点选） ====================
 elif menu == "❄️ 添加冻存管":
