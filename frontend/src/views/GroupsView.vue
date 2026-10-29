@@ -62,7 +62,7 @@
     <el-dialog v-model="dialogVisible" :title="editing ? '编辑细胞组' : '新建细胞组'" width="min(480px, 94vw)">
       <el-form :model="form" label-width="80px" label-position="left">
         <el-form-item label="组名" required>
-          <el-input v-model="form.group_name" placeholder="例如 LT+hTERT 稳系、温度实验" />
+          <el-input v-model="form.group_name" placeholder="例如：传代实验组、冻存组" />
         </el-form-item>
         <el-form-item label="备注">
           <el-input v-model="form.notes" type="textarea" :rows="3" />

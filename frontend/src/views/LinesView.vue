@@ -61,7 +61,7 @@
     <el-dialog v-model="dialogVisible" :title="editing ? '编辑细胞株' : '添加细胞株'" width="min(540px, 94vw)">
       <el-form :model="form" label-width="120px" label-position="left">
         <el-form-item label="名称" required>
-          <el-input v-model="form.name" placeholder="例如 HeLa、1#PWMF-LT" />
+          <el-input v-model="form.name" placeholder="例如 HeLa、A549、MCF-7" />
         </el-form-item>
         <el-form-item label="类型">
           <el-select v-model="form.type" style="width: 100%">
