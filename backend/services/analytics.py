@@ -1,0 +1,270 @@
+"""看板统计、增殖速率与生长曲线数据。"""
+
+from __future__ import annotations
+
+import sqlite3
+from datetime import date, timedelta
+from typing import Any
+
+from ..domain import remaining_days
+from ..errors import ValidationError
+from . import fetch_all, get_or_404, placeholders
+
+
+def dashboard(conn: sqlite3.Connection) -> dict[str, Any]:
+    today = date.today()
+    week_ago = (today - timedelta(days=7)).isoformat()
+
+    def scalar(sql: str, params: tuple[Any, ...] = ()) -> int:
+        return int(conn.execute(sql, params).fetchone()[0] or 0)
+
+    active_batches = scalar("SELECT COUNT(*) FROM culture_batches WHERE is_active = 1")
+    active_lines = scalar(
+        "SELECT COUNT(DISTINCT cell_line_id) FROM culture_batches WHERE is_active = 1"
+    )
+    total_lines = scalar("SELECT COUNT(*) FROM cell_lines")
+    total_groups = scalar("SELECT COUNT(*) FROM cell_groups")
+    total_vials = scalar("SELECT COUNT(*) FROM frozen_vials")
+    in_stock_vials = scalar("SELECT COUNT(*) FROM frozen_vials WHERE status = '在库'")
+    total_records = scalar("SELECT COUNT(*) FROM culture_records")
+    recent_records = scalar(
+        "SELECT COUNT(*) FROM culture_records WHERE date >= ?", (week_ago,)
+    )
+
+    due_rows = fetch_all(
+        conn,
+        """
+        SELECT cb.id AS batch_id, cb.batch_name, cl.name AS cell_line, cl.id AS cell_line_id,
+               cr.next_passage_date, cr.passage, cr.status, cr.cumulative_pd
+        FROM culture_batches cb
+        JOIN cell_lines cl ON cl.id = cb.cell_line_id
+        JOIN culture_records cr ON cr.id = (
+            SELECT id FROM culture_records r WHERE r.batch_id = cb.id AND r.is_active = 1
+            ORDER BY r.date DESC, r.id DESC LIMIT 1
+        )
+        WHERE cb.is_active = 1 AND cr.next_passage_date IS NOT NULL AND cr.next_passage_date <> ''
+        ORDER BY cr.next_passage_date
+        """,
+    )
+    for row in due_rows:
+        row["remaining_days"] = remaining_days(row["next_passage_date"], today)
+    due_soon = [row for row in due_rows if row["remaining_days"] is not None and row["remaining_days"] <= 3]
+
+    recent = fetch_all(
+        conn,
+        """
+        SELECT cr.id, cr.date, cr.passage, cr.pd, cr.cumulative_pd, cr.harvested_cells,
+               cr.inoculum_cells, cr.inoculum_dishes, cr.status, cr.notes,
+               cb.id AS batch_id, cb.batch_name, cl.name AS cell_line
+        FROM culture_records cr
+        JOIN culture_batches cb ON cb.id = cr.batch_id
+        JOIN cell_lines cl ON cl.id = cb.cell_line_id
+        ORDER BY cr.date DESC, cr.id DESC LIMIT 10
+        """,
+    )
+
+    month_start = (today.replace(day=1) - timedelta(days=150)).replace(day=1).isoformat()
+    monthly = fetch_all(
+        conn,
+        """
+        SELECT substr(date, 1, 7) AS month, COUNT(*) AS count
+        FROM culture_records WHERE date >= ?
+        GROUP BY month ORDER BY month
+        """,
+        (month_start,),
+    )
+
+    return {
+        "stats": {
+            "active_cell_lines": active_lines,
+            "active_batches": active_batches,
+            "total_cell_lines": total_lines,
+            "total_groups": total_groups,
+            "total_vials": total_vials,
+            "in_stock_vials": in_stock_vials,
+            "total_records": total_records,
+            "records_last_7_days": recent_records,
+        },
+        "due_soon": due_soon,
+        "all_due": due_rows,
+        "recent_records": recent,
+        "records_by_month": monthly,
+        "today": today.isoformat(),
+    }
+
+
+def _active_member_ids(conn: sqlite3.Connection, group_id: int) -> list[int]:
+    get_or_404(conn, "cell_groups", group_id, "细胞组")
+    return [
+        int(row["cell_line_id"])
+        for row in conn.execute(
+            "SELECT cell_line_id FROM cell_group_members WHERE group_id = ? ORDER BY sort_order, cell_line_id",
+            (group_id,),
+        ).fetchall()
+    ]
+
+
+def group_rates(conn: sqlite3.Connection, group_id: int) -> list[dict[str, Any]]:
+    """组内活跃批次最近三次 PD/天 的均值（旧版「增殖速率对比」）。"""
+    member_ids = _active_member_ids(conn, group_id)
+    if not member_ids:
+        return []
+    batches = fetch_all(
+        conn,
+        f"""
+        SELECT cb.id AS batch_id, cb.batch_name, cl.name AS cell_line
+        FROM culture_batches cb JOIN cell_lines cl ON cl.id = cb.cell_line_id
+        WHERE cb.is_active = 1 AND cb.cell_line_id IN ({placeholders(member_ids)})
+        ORDER BY cl.name, cb.batch_name
+        """,
+        tuple(member_ids),
+    )
+    results: list[dict[str, Any]] = []
+    for batch in batches:
+        records = fetch_all(
+            conn,
+            "SELECT date, pd, harvested_cells FROM culture_records WHERE batch_id = ? "
+            "ORDER BY date ASC, id ASC",
+            (batch["batch_id"],),
+        )
+        samples: list[dict[str, Any]] = []
+        previous_date: date | None = None
+        for record in records:
+            current_date = date.fromisoformat(record["date"]) if record["date"] else None
+            if previous_date is not None and current_date is not None:
+                interval = (current_date - previous_date).days
+                pd_value = record["pd"]
+                if interval > 0 and pd_value is not None:
+                    samples.append({
+                        "date": record["date"],
+                        "interval_days": interval,
+                        "pd": float(pd_value),
+                        "pd_per_day": round(float(pd_value) / interval, 4),
+                    })
+            if current_date is not None:
+                previous_date = current_date
+        if not samples:
+            continue
+        last_three = samples[-3:]
+        average = round(sum(sample["pd_per_day"] for sample in last_three) / len(last_three), 4)
+        results.append({
+            **batch,
+            "avg_pd_per_day": average,
+            "samples": last_three,
+        })
+    return results
+
+
+def group_curves(
+    conn: sqlite3.Connection,
+    group_id: int,
+    *,
+    normalize: bool = False,
+    start_date: str | None = None,
+    ended_ids: list[int] | None = None,
+) -> dict[str, Any]:
+    """组内生长曲线：活跃批次 + 指定已终止批次；可选按起始日期标准化。"""
+    member_ids = _active_member_ids(conn, group_id)
+    if not member_ids:
+        return {"series": [], "dates": [], "normalize": normalize, "start_date": start_date,
+                "ended_batches": [], "skipped": []}
+
+    active_batches = fetch_all(
+        conn,
+        f"""
+        SELECT cb.id AS batch_id, cb.batch_name, cl.name AS cell_line, 0 AS ended
+        FROM culture_batches cb JOIN cell_lines cl ON cl.id = cb.cell_line_id
+        WHERE cb.is_active = 1 AND cb.cell_line_id IN ({placeholders(member_ids)})
+        ORDER BY cl.name, cb.batch_name, cb.id
+        """,
+        tuple(member_ids),
+    )
+    ended_batches = fetch_all(
+        conn,
+        f"""
+        SELECT cb.id AS batch_id, cb.batch_name, cl.name AS cell_line, 1 AS ended
+        FROM culture_batches cb JOIN cell_lines cl ON cl.id = cb.cell_line_id
+        WHERE cb.is_active = 0 AND cb.cell_line_id IN ({placeholders(member_ids)})
+        ORDER BY cl.name, cb.batch_name, cb.id
+        """,
+        tuple(member_ids),
+    )
+    ended_lookup = {int(row["batch_id"]): row for row in ended_batches}
+
+    selected_ended: list[dict[str, Any]] = []
+    for raw_id in ended_ids or []:
+        try:
+            batch_id = int(raw_id)
+        except (TypeError, ValueError):
+            continue
+        if batch_id in ended_lookup:
+            selected_ended.append(ended_lookup[batch_id])
+
+    all_batches = active_batches + selected_ended
+    series: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+    all_dates: set[str] = set()
+
+    for batch in all_batches:
+        records = fetch_all(
+            conn,
+            "SELECT date, pd, cumulative_pd, harvested_cells, passage FROM culture_records "
+            "WHERE batch_id = ? ORDER BY date ASC, id ASC",
+            (batch["batch_id"],),
+        )
+        if not records:
+            skipped.append({"batch_id": batch["batch_id"], "reason": "没有传代记录"})
+            continue
+        for record in records:
+            all_dates.add(record["date"])
+
+        name = batch["batch_name"]
+        points = [
+            {
+                "date": record["date"],
+                "passage": record["passage"],
+                "value": record["cumulative_pd"],
+                "cumulative_pd": record["cumulative_pd"],
+                "pd": record["pd"],
+                "harvested_cells": record["harvested_cells"],
+            }
+            for record in records
+        ]
+
+        if normalize:
+            if not start_date:
+                raise ValidationError("标准化模式必须提供起始日期")
+            exact = next((record for record in records if record["date"] == start_date), None)
+            if exact is None:
+                skipped.append({"batch_id": batch["batch_id"], "reason": f"{start_date} 当天没有记录"})
+                continue
+            base = float(exact["cumulative_pd"] or 0)
+            if base == 0:
+                skipped.append({"batch_id": batch["batch_id"], "reason": "起始累计 PD 为 0，无法标准化"})
+                continue
+            points = [
+                point for point in points if point["date"] >= start_date
+            ]
+            for point in points:
+                point["value"] = round(float(point["cumulative_pd"]) / base, 3)
+
+        series.append({
+            "batch_id": batch["batch_id"],
+            "batch_name": batch["batch_name"],
+            "cell_line": batch["cell_line"],
+            "name": name,
+            "ended": bool(batch["ended"]),
+            "points": points,
+        })
+
+    return {
+        "series": series,
+        "dates": sorted(all_dates),
+        "normalize": normalize,
+        "start_date": start_date,
+        "ended_batches": [
+            {"batch_id": row["batch_id"], "batch_name": row["batch_name"], "cell_line": row["cell_line"]}
+            for row in ended_batches
+        ],
+        "skipped": skipped,
+    }
