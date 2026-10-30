@@ -4,13 +4,110 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import socket
+import subprocess
 import sys
 import threading
 import webbrowser
 
 from . import create_app
 from .config import APP_VERSION, Config
+
+
+EDGE_PATHS = (
+    r"%ProgramFiles(x86)%\Microsoft\Edge\Application\msedge.exe",
+    r"%ProgramFiles%\Microsoft\Edge\Application\msedge.exe",
+)
+CHROME_PATHS = (
+    r"%ProgramFiles%\Google\Chrome\Application\chrome.exe",
+    r"%ProgramFiles(x86)%\Google\Chrome\Application\chrome.exe",
+    r"%LocalAppData%\Google\Chrome\Application\chrome.exe",
+)
+
+
+def _find_executable(paths: tuple[str, ...]) -> str | None:
+    for raw in paths:
+        candidate = os.path.expandvars(raw)
+        if "%" in candidate:
+            continue
+        if os.path.isfile(candidate):
+            return candidate
+    return None
+
+
+def _default_browser_kind() -> str:
+    if os.name != "nt":
+        return "default"
+    try:
+        import winreg
+
+        with winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\Shell\Associations\UrlAssociations\http\UserChoice",
+        ) as key:
+            prog_id = str(winreg.QueryValueEx(key, "ProgId")[0]).lower()
+    except (OSError, ImportError):
+        return "default"
+    if "edge" in prog_id:
+        return "edge"
+    if "chrome" in prog_id:
+        return "chrome"
+    return "default"
+
+
+def open_url(url: str, config: Config) -> None:
+    """打开浏览器。
+
+    Edge 作为默认浏览器时，如果系统中存在以管理员权限运行的 Edge 实例，
+    普通进程直接把网址交给它会弹出「现有实例正在以提升的权限运行」。
+    优先用 Chrome 打开；没有 Chrome 时，用独立配置目录启动一个 Edge 窗口。
+    """
+    if os.name == "nt":
+        browser = _default_browser_kind()
+        if browser == "edge":
+            chrome = _find_executable(CHROME_PATHS)
+            if chrome:
+                try:
+                    subprocess.Popen(
+                        [chrome, "--new-window", "--no-first-run", "--no-default-browser-check", url],
+                        close_fds=True,
+                    )
+                    return
+                except OSError:
+                    pass
+            edge = _find_executable(EDGE_PATHS)
+            if edge:
+                profile = config.db_path.parent / "browser-profile" / "edge"
+                try:
+                    profile.mkdir(parents=True, exist_ok=True)
+                    subprocess.Popen(
+                        [
+                            edge,
+                            f"--user-data-dir={profile}",
+                            "--no-first-run",
+                            "--no-default-browser-check",
+                            "--disable-sync",
+                            "--new-window",
+                            url,
+                        ],
+                        close_fds=True,
+                    )
+                    return
+                except OSError:
+                    pass
+        elif browser == "chrome":
+            chrome = _find_executable(CHROME_PATHS)
+            if chrome:
+                try:
+                    subprocess.Popen(
+                        [chrome, "--new-window", "--no-first-run", "--no-default-browser-check", url],
+                        close_fds=True,
+                    )
+                    return
+                except OSError:
+                    pass
+    webbrowser.open(url)
 
 
 def lan_addresses() -> list[str]:
@@ -96,11 +193,9 @@ def main(argv: list[str] | None = None) -> int:
     # 端口被占用时给出明确提示，而不是抛出一大段 traceback
     if not port_available(config.host, config.port):
         if existing_celltracker(config.port):
+            print(f"CellTracker 已经运行在 {local_url}")
             if config.open_browser and not args.no_browser:
-                print(f"CellTracker 已经在 {local_url} 运行，正在为你打开浏览器…")
-                webbrowser.open(local_url)
-            else:
-                print(f"CellTracker 已经在 {local_url} 运行。")
+                open_url(local_url, config)
             return 0
         print("=" * 62)
         print(f" 端口 {config.port} 已被其他程序占用，CellTracker 无法启动。")
@@ -128,7 +223,7 @@ def main(argv: list[str] | None = None) -> int:
     print("=" * 62, flush=True)
 
     if config.open_browser and not args.no_browser:
-        threading.Timer(1.2, lambda: webbrowser.open(local_url)).start()
+        threading.Timer(1.2, lambda: open_url(local_url, config)).start()
 
     try:
         from waitress import serve
